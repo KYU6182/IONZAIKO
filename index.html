@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ION STAY 統合在庫管理</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        .scrollbar-hide::-webkit-scrollbar { display: none; }
+        .scrollbar-hide { -ms-overflow-style: none; scrollbar-width: none; }
+        input[type="number"]::-webkit-outer-spin-button,
+        input[type="number"]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+    </style>
+</head>
+<body class="bg-[#F8FAFC]">
+    <div id="root"></div>
+
+    <script type="module">
+        import React, { useState, useEffect, useMemo } from 'https://esm.sh/react@18.2.0';
+        import { createRoot } from 'https://esm.sh/react-dom@18.2.0/client';
+        import { 
+            AlertCircle, Search, Clock, Plus, X, BarChart3, List, ImageIcon, Camera, Loader2, 
+            Trash2, MinusCircle, PlusCircle, CheckCircle2, ChevronRight
+        } from 'https://esm.sh/lucide-react@0.344.0?bundle';
+        
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.1.0/firebase-app.js";
+        import { getAuth, signInAnonymously } from "https://www.gstatic.com/firebasejs/11.1.0/firebase-auth.js";
+        import { getFirestore, collection, doc, onSnapshot, updateDoc, setDoc, deleteDoc, addDoc } from "https://www.gstatic.com/firebasejs/11.1.0/firebase-firestore.js";
+        import { getStorage, ref, uploadBytes, getDownloadURL } from "https://www.gstatic.com/firebasejs/11.1.0/firebase-storage.js";
+
+        const firebaseConfig = {
+            apiKey: "AIzaSyBbzFujP0P7ExZ9m_ofnUGwHvTSFFgC1Ks",
+            authDomain: "project-7549205985465687953.firebaseapp.com",
+            projectId: "project-7549205985465687953",
+            storageBucket: "project-7549205985465687953.firebasestorage.app",
+            messagingSenderId: "814748288068",
+            appId: "1:814748288068:web:9c34b5e0476eb4313ae811"
+        };
+
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+        const storage = getStorage(app);
+        const appId = 'ion-stay-inventory-system';
+
+        const locations = ['事務所', '天神', '博多', '清川', 'エブリィ', 'IONビル２階'];
+        const units = ['個', '本', 'パック', '枚', 'セット', 'ロール'];
+
+        const App = () => {
+            const [items, setItems] = useState([]);
+            const [logs, setLogs] = useState([]);
+            const [loading, setLoading] = useState(true);
+            const [searchTerm, setSearchTerm] = useState('');
+            const [filterLoc, setFilterLoc] = useState('全拠点');
+            const [expandedId, setExpandedId] = useState(null);
+            const [saveStatus, setSaveStatus] = useState('');
+            const [isModalOpen, setIsModalOpen] = useState(false);
+            const [deleteTarget, setDeleteTarget] = useState(null);
+            const [uploadingId, setUploadingId] = useState(null);
+            
+            // 新規登録用ステート
+            const [newItem, setNewItem] = useState({
+                name: '', location: '事務所', stock: 10, threshold: 5, unit: '個', memo: '', imageUrl: ''
+            });
+
+            useEffect(() => {
+                signInAnonymously(auth);
+                const invCol = collection(db, 'artifacts', appId, 'public', 'data', 'inventory');
+                const logCol = collection(db, 'artifacts', appId, 'public', 'data', 'usage_logs');
+                const unsubInv = onSnapshot(invCol, snap => {
+                    setItems(snap.docs.map(doc => ({ id: doc.id, ...doc.data() })));
+                    setLoading(false);
+                });
+                const unsubLog = onSnapshot(logCol, snap => setLogs(snap.docs.map(doc => doc.data())));
+                return () => { unsubInv(); unsubLog(); };
+            }, []);
+
+            const updateItemField = async (id, field, value) => {
+                setSaveStatus('保存中...');
+                try {
+                    const itemDoc = doc(db, 'artifacts', appId, 'public', 'data', 'inventory', id);
+                    const updateData = { [field]: value, lastChecked: new Date().toISOString() };
+                    await updateDoc(itemDoc, updateData);
+                    setSaveStatus('完了');
+                    setTimeout(() => setSaveStatus(''), 1000);
+                } catch (err) { alert('保存失敗: ' + err.message); }
+            };
+
+            const handleImageUpload = async (file, id = null) => {
+                if (!file) return;
+                const targetId = id || 'new';
+                setUploadingId(targetId);
+                try {
+                    const storageRef = ref(storage, `inventory/${Date.now()}_${file.name}`);
+                    const snapshot = await uploadBytes(storageRef, file);
+                    const url = await getDownloadURL(snapshot.ref);
+                    
+                    if (id) {
+                        await updateItemField(id, 'imageUrl', url);
+                    } else {
+                        setNewItem(prev => ({ ...prev, imageUrl: url }));
+                    }
+                } catch (err) {
+                    alert('アップロード失敗: Storageの「ルール」で書き込みが許可されているか確認してください。');
+                    console.error(err);
+                } finally {
+                    setUploadingId(null);
+                }
+            };
+
+            const processedItems = useMemo(() => {
+                let filtered = items.filter(i => (filterLoc === '全拠点' || i.location === filterLoc) && i.name.includes(searchTerm));
+                const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+                
+                return filtered.map(item => {
+                    const itemLogs = logs.filter(l => l.itemId === item.id && new Date(l.timestamp) > sevenDaysAgo);
+                    const totalUsed = itemLogs.reduce((sum, l) => sum + l.amount, 0);
+                    const dailyAvg = totalUsed / 7;
+                    const daysLeft = dailyAvg > 0 ? Math.floor(item.stock / dailyAvg) : Infinity;
+                    return { ...item, daysLeft };
+                }).sort((a, b) => (Number(a.stock) <= Number(a.threshold) ? -1 : 1));
+            }, [items, logs, filterLoc, searchTerm]);
+
+            if (loading) return React.createElement('div', { className: 'h-screen flex items-center justify-center font-black text-slate-300 animate-pulse' }, 'LOADING ION STAY...');
+
+            return React.createElement('div', { className: 'min-h-screen pb-40' },
+                // ステータス表示
+                saveStatus && React.createElement('div', { className: 'fixed top-6 left-1/2 -translate-x-1/2 z-[100] bg-slate-900 text-white px-8 py-3 rounded-full text-xs font-black shadow-2xl' }, saveStatus),
+
+                // ヘッダー
+                React.createElement('header', { className: 'bg-white/90 backdrop-blur-md sticky top-0 z-40 border-b' },
+                    React.createElement('div', { className: 'max-w-2xl mx-auto p-4' },
+                        React.createElement('h1', { className: 'text-2xl font-black text-slate-800 mb-4' }, 'ION STAY'),
+                        React.createElement('div', { className: 'flex gap-2 overflow-x-auto scrollbar-hide mb-4' },
+                            ['全拠点', ...locations].map(loc => React.createElement('button', {
+                                key: loc, onClick: () => setFilterLoc(loc),
+                                className: `px-5 py-2 rounded-2xl text-[11px] font-black whitespace-nowrap transition-all ${filterLoc === loc ? 'bg-blue-600 text-white shadow-lg' : 'bg-slate-100 text-slate-400'}`
+                            }, loc))
+                        ),
+                        React.createElement('div', { className: 'relative' },
+                            React.createElement(Search, { className: 'absolute left-4 top-1/2 -translate-y-1/2 text-slate-300', size: 18 }),
+                            React.createElement('input', { type: 'text', placeholder: '品名を検索...', className: 'w-full pl-12 pr-4 py-4 bg-slate-100 rounded-2xl font-bold outline-none focus:bg-white focus:ring-2 focus:ring-blue-100 transition-all', value: searchTerm, onChange: e => setSearchTerm(e.target.value) })
+                        )
+                    )
+                ),
+
+                // メインリスト
+                React.createElement('main', { className: 'max-w-2xl mx-auto p-4 space-y-4' },
+                    processedItems.map(item => React.createElement('div', { 
+                        key: item.id, 
+                        className: `bg-white border rounded-[2rem] overflow-hidden transition-all shadow-sm ${expandedId === item.id ? 'border-blue-200 ring-4 ring-blue-50' : 'border-slate-100'}` 
+                    },
+                        // メイン表示部分
+                        React.createElement('div', { className: 'p-5 flex items-center gap-4 cursor-pointer', onClick: () => setExpandedId(expandedId === item.id ? null : item.id) },
+                            // 画像
+                            React.createElement('div', { className: 'relative flex-shrink-0', onClick: e => e.stopPropagation() },
+                                uploadingId === item.id ? 
+                                    React.createElement('div', { className: 'w-16 h-16 rounded-3xl bg-slate-50 flex items-center justify-center' }, React.createElement(Loader2, { className: 'animate-spin text-blue-500' })) :
+                                    React.createElement('label', { className: 'block cursor-pointer hover:opacity-80 transition' },
+                                        item.imageUrl ? React.createElement('img', { src: item.imageUrl, className: 'w-16 h-16 rounded-3xl object-cover border-2 border-white shadow-sm' }) :
+                                        React.createElement('div', { className: 'w-16 h-16 rounded-3xl bg-slate-50 flex items-center justify-center text-slate-300 border-2 border-dashed' }, React.createElement(Camera, { size: 24 })),
+                                        React.createElement('input', { type: 'file', className: 'hidden', accept: 'image/*', onChange: e => handleImageUpload(e.target.files[0], item.id) })
+                                    )
+                            ),
+                            // 品名と拠点
+                            React.createElement('div', { className: 'flex-1 min-w-0' },
+                                React.createElement('select', { 
+                                    className: 'bg-slate-800 text-white text-[8px] font-black px-2 py-0.5 rounded-lg outline-none mb-1',
+                                    value: item.location,
+                                    onClick: e => e.stopPropagation(),
+                                    onChange: e => updateItemField(item.id, 'location', e.target.value)
+                                }, locations.map(l => React.createElement('option', {key:l, value:l}, l))),
+                                React.createElement('input', { 
+                                    className: 'font-black text-slate-800 bg-transparent outline-none w-full text-lg block',
+                                    value: item.name,
+                                    onClick: e => e.stopPropagation(),
+                                    onChange: e => updateItemField(item.id, 'name', e.target.value)
+                                }),
+                                React.createElement('div', { className: 'text-[9px] text-slate-400 font-bold mt-1' }, `更新: ${item.lastChecked ? new Date(item.lastChecked).toLocaleString('ja-JP', {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'}) : '未点検'}`)
+                            ),
+                            // 在庫調整 (ボタン + 直接入力)
+                            React.createElement('div', { className: 'flex items-center gap-2 bg-slate-50 p-1 rounded-2xl border border-slate-100', onClick: e => e.stopPropagation() },
+                                React.createElement('button', { onClick: () => updateItemField(item.id, 'stock', Math.max(0, Number(item.stock)-1)), className: 'text-slate-300 p-1' }, React.createElement(MinusCircle, { size: 24 })),
+                                React.createElement('div', { className: 'flex flex-col items-center' },
+                                    React.createElement('input', { 
+                                        type: 'number', className: `w-12 text-center font-black bg-transparent outline-none text-md ${Number(item.stock) <= Number(item.threshold) ? 'text-red-500' : 'text-blue-600'}`,
+                                        value: item.stock, 
+                                        onChange: e => updateItemField(item.id, 'stock', parseInt(e.target.value) || 0)
+                                    }),
+                                    React.createElement('span', { className: 'text-[7px] font-black text-slate-300 uppercase' }, item.unit || '個')
+                                ),
+                                React.createElement('button', { onClick: () => updateItemField(item.id, 'stock', Number(item.stock)+1), className: 'text-slate-300 p-1' }, React.createElement(PlusCircle, { size: 24 }))
+                            )
+                        ),
+                        // 詳細部分
+                        expandedId === item.id && React.createElement('div', { className: 'px-5 pb-6 pt-2 border-t border-slate-50 space-y-5 animate-in slide-in-from-top-2' },
+                            React.createElement('div', { className: 'grid grid-cols-2 gap-4' },
+                                React.createElement('div', null,
+                                    React.createElement('label', { className: 'text-[9px] font-black text-slate-400 uppercase ml-1 block mb-1' }, '補充アラート (残り個数)'),
+                                    React.createElement('input', { type: 'number', className: 'w-full p-3 bg-red-50 rounded-2xl font-black text-red-600 outline-none', value: item.threshold, onChange: e => updateItemField(item.id, 'threshold', e.target.value) })
+                                ),
+                                React.createElement('div', null,
+                                    React.createElement('label', { className: 'text-[9px] font-black text-slate-400 uppercase ml-1 block mb-1' }, '補充予測'),
+                                    React.createElement('div', { className: 'p-3 bg-blue-50 rounded-2xl font-black text-blue-600 text-xs' }, item.daysLeft === Infinity ? '十分な在庫' : `あと 約 ${item.daysLeft} 日`)
+                                )
+                            ),
+                            React.createElement('div', null,
+                                React.createElement('label', { className: 'text-[9px] font-black text-slate-400 uppercase ml-1 block mb-1' }, '備考・メモ'),
+                                React.createElement('textarea', { 
+                                    className: 'w-full p-4 bg-slate-50 rounded-2xl font-bold text-xs h-20 outline-none resize-none', 
+                                    placeholder: '保管場所など', value: item.memo || '',
+                                    onChange: e => updateItemField(item.id, 'memo', e.target.value)
+                                })
+                            ),
+                            React.createElement('button', { 
+                                onClick: () => setDeleteTarget(item),
+                                className: 'w-full py-3 text-red-400 font-black text-[10px] uppercase border border-red-100 rounded-xl hover:bg-red-50' 
+                            }, 'このアイテムを削除する')
+                        )
+                    ))
+                ),
+
+                // フローティング追加ボタン
+                React.createElement('button', { 
+                    onClick: () => setIsModalOpen(true),
+                    className: 'fixed bottom-10 right-8 bg-blue-600 text-white w-16 h-16 rounded-[2rem] shadow-2xl flex items-center justify-center active:scale-90 transition-all z-50' 
+                }, React.createElement(Plus, { size: 32 })),
+
+                // フル登録モーダル
+                isModalOpen && React.createElement('div', { className: 'fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-[100] flex items-end justify-center' },
+                    React.createElement('div', { className: 'bg-white rounded-t-[3rem] w-full max-w-2xl h-[90vh] overflow-y-auto p-8 shadow-2xl animate-in slide-in-from-bottom duration-300' },
+                        React.createElement('div', { className: 'flex justify-between items-center mb-8 sticky top-0 bg-white py-2 z-10' },
+                            React.createElement('h3', { className: 'font-black text-2xl' }, '全項目を登録'),
+                            React.createElement('button', { onClick: () => setIsModalOpen(false) }, React.createElement(X, { size: 28 }))
+                        ),
+                        React.createElement('div', { className: 'space-y-6' },
+                            // 画像
+                            React.createElement('div', { className: 'flex justify-center' },
+                                React.createElement('label', { className: 'relative cursor-pointer' },
+                                    uploadingId === 'new' ? React.createElement(Loader2, { className: 'animate-spin text-blue-500 w-32 h-32' }) :
+                                    newItem.imageUrl ? React.createElement('img', { src: newItem.imageUrl, className: 'w-32 h-32 rounded-[2.5rem] object-cover border-4 border-white shadow-xl' }) :
+                                    React.createElement('div', { className: 'w-32 h-32 rounded-[2.5rem] bg-slate-50 border-2 border-dashed border-slate-200 flex flex-col items-center justify-center text-slate-400' }, 
+                                        React.createElement(Camera, { size: 32 }), React.createElement('span', { className: 'text-[10px] font-black mt-2' }, '写真を登録')
+                                    ),
+                                    React.createElement('input', { type: 'file', className: 'hidden', onChange: e => handleImageUpload(e.target.files[0]) })
+                                )
+                            ),
+                            // 入力
+                            React.createElement('div', { className: 'space-y-4' },
+                                React.createElement('input', { placeholder: '品名', className: 'w-full p-5 bg-slate-50 rounded-2xl font-black outline-none border-2 border-transparent focus:border-blue-500', value: newItem.name, onChange: e => setNewItem({...newItem, name: e.target.value}) }),
+                                React.createElement('div', { className: 'grid grid-cols-2 gap-4' },
+                                    React.createElement('select', { className: 'p-5 bg-slate-50 rounded-2xl font-black outline-none', value: newItem.location, onChange: e => setNewItem({...newItem, location: e.target.value}) },
+                                        locations.map(l => React.createElement('option', {key:l, value:l}, l))
+                                    ),
+                                    React.createElement('select', { className: 'p-5 bg-slate-50 rounded-2xl font-black outline-none', value: newItem.unit, onChange: e => setNewItem({...newItem, unit: e.target.value}) },
+                                        units.map(u => React.createElement('option', {key:u, value:u}, u))
+                                    )
+                                ),
+                                React.createElement('div', { className: 'grid grid-cols-2 gap-4' },
+                                    React.createElement('div', null,
+                                        React.createElement('label', { className: 'text-[10px] font-black text-slate-400 ml-2 mb-1 block' }, '現在の在庫'),
+                                        React.createElement('input', { type: 'number', className: 'w-full p-5 bg-slate-100 rounded-2xl font-black outline-none', value: newItem.stock, onChange: e => setNewItem({...newItem, stock: parseInt(e.target.value) || 0}) })
+                                    ),
+                                    React.createElement('div', null,
+                                        React.createElement('label', { className: 'text-[10px] font-black text-red-400 ml-2 mb-1 block' }, '補充アラート数'),
+                                        React.createElement('input', { type: 'number', className: 'w-full p-5 bg-red-50 rounded-2xl font-black outline-none', value: newItem.threshold, onChange: e => setNewItem({...newItem, threshold: parseInt(e.target.value) || 0}) })
+                                    )
+                                ),
+                                React.createElement('textarea', { placeholder: '備考 (保管場所など)', className: 'w-full p-5 bg-slate-50 rounded-2xl font-black outline-none h-24', value: newItem.memo, onChange: e => setNewItem({...newItem, memo: e.target.value}) }),
+                                React.createElement('button', { 
+                                    className: 'w-full py-5 bg-blue-600 text-white rounded-3xl font-black text-lg shadow-xl',
+                                    onClick: async () => {
+                                        if(!newItem.name) return alert('品名を入力してください');
+                                        const id = crypto.randomUUID();
+                                        await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'inventory', id), { ...newItem, id, lastChecked: new Date().toISOString() });
+                                        setIsModalOpen(false);
+                                        setNewItem({ name: '', location: '事務所', stock: 10, threshold: 5, unit: '個', memo: '', imageUrl: '' });
+                                    }
+                                }, '保存する')
+                            )
+                        )
+                    )
+                ),
+
+                // 削除確認
+                deleteTarget && React.createElement('div', { className: 'fixed inset-0 bg-slate-900/80 backdrop-blur-md z-[110] flex items-center justify-center p-6' },
+                    React.createElement('div', { className: 'bg-white rounded-[3rem] w-full max-w-xs p-10 text-center space-y-6' },
+                        React.createElement(Trash2, { size: 48, className: 'mx-auto text-red-500' }),
+                        React.createElement('h3', { className: 'font-black text-xl' }, '本当に削除しますか？'),
+                        React.createElement('div', { className: 'flex gap-3' },
+                            React.createElement('button', { onClick: () => setDeleteTarget(null), className: 'flex-1 py-4 bg-slate-100 rounded-2xl font-black' }, 'やめる'),
+                            React.createElement('button', { 
+                                className: 'flex-1 py-4 bg-red-500 text-white rounded-2xl font-black',
+                                onClick: async () => {
+                                    await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'inventory', deleteTarget.id));
+                                    setDeleteTarget(null);
+                                }
+                            }, '削除')
+                        )
+                    )
+                )
+            );
+        };
+
+        createRoot(document.getElementById('root')).render(React.createElement(App));
+    </script>
+</body>
+</html>
